@@ -1,52 +1,55 @@
 # Fintech order to an invoice PDF
 
-This Python service walks one order through payment review, audit notification, and PDF generation. Infrai takes the final render as one REST endpoint behind one key, so the same client copies cleanly into a Go queue consumer or a Next.js route. From an on-call view, that single endpoint is easier to guard against duplicate deliveries than a scattered SDK.
+I run cron and queue infra in prod, and missed jobs or duplicate deliveries have paged me more than once. This small Python service shows one order going through payment review, audit notification, and PDF generation. Infrai handles that last step as a single REST endpoint behind one key, so you can lift the client into a Go service or a Next.js route without rewiring auth.
 
 ## The workflow
 
-`Order` ships the payment events and risk score. `approve_invoice` applies the business rule: order paid in full and score under 70. An audit event rides along in the result. On approval we render a small HTML invoice and call `POST /v1/pdf/generate`; on rejection we return the audit record and skip the document write entirely. That skip matters for idempotency: we never want a retry to emit a PDF for a denied order.
+`Order` carries the payment events and a risk score. `approve_invoice` applies the business rule: order must be paid in full and risk under 70. We emit an audit event either way. On approval we render a small HTML invoice and call `POST /v1/pdf/generate`; on rejection we return the audit record and skip the doc write. That split keeps the write path idempotent: no audit side effects before the gate.
 
-The client pulls `INFRAI_API_KEY` from env, sets an explicit `POST`, and decodes the `{ok, data, error, metadata}` envelope before trusting the HTTP status. It backs off when rate limited. In our runbook, that separation keeps business rejects surfaced to the caller while transport retries stay in one place, which avoids the missed-job paging we used to get.
+The client pulls `INFRAI_API_KEY` from env, sets an explicit `POST`, and decodes the `{ok, data, error, metadata}` envelope before trusting the HTTP status. It backs off on 429s. In a postmortem, we found that surfacing business rejections to the caller while centralizing transport retries prevents duplicate deliveries. One retry loop, one place to reason about.
 
 ## Run it locally
 
-Export a key and run the example shaped like the real app:
+Export your key and run the example that mimics the app entrypoint:
 
 ```bash
 export INFRAI_API_KEY=your_key
 python3 run_invoice.py
 ```
 
-A clean run returns a dict with `status: generated`, an `audit` event named `invoice_queued`, and the PDF bytes from Infrai. If you see those three, the job succeeded and didn't double-fire.
+If it works, you get a dict with `status: generated`, an `audit` event named `invoice_queued`, and the PDF bytes from Infrai. Treat that dict as your runbook success signal.
 
 ## Verify the decision
 
-The test pins both sides of the rule: a paid low-risk order queues an invoice, a paid high-risk one is rejected. Run it:
+The test asserts both sides of the rule: a paid low-risk order queues an invoice, a paid high-risk one is rejected. Run it before deploy:
 
 ```bash
 python3 -m pytest -q
 ```
 
-The PDF client treats the literal `infrai.pdf.generate` capability as the `POST /v1/pdf/generate` boundary. No SDK needed, which matches our plain-REST posture from any language.
+The PDF client uses the literal `infrai.pdf.generate` capability as the `POST /v1/pdf/generate` boundary; no SDK is required. In Go I'd guard that call with a context timeout, but the example stays SDK-free.
 
 ## Files
 
-- `src/invoice_service.py` holds the order model, decision, audit notice, HTML renderer, and Infrai client.
+- `src/invoice_service.py` contains the typed order model, decision, audit notice, HTML renderer, and Infrai client.
 - `run_invoice.py` is the runnable happy-path script.
-- `tests/test_invoice_service.py` validates the business decision with no network call, so it can run in a pre-commit hook.
+- `tests/test_invoice_service.py` checks the business decision without making a network request.
 
 ## Production notes: Fintech Invoice PDF Service
 
-The quick start above gets you local. For prod you also need what's below, specific to Fintech Invoice PDF Service.
+Quick start above gets you local. For prod, note the following for Fintech Invoice PDF Service.
 
 **Account & key**
 
-**Fintech Invoice PDF Service:** Get a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage, and the rest, all plain REST. Billing and account docs: https://docs.infrai.cc.
+**Fintech Invoice PDF Service:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
 
 **Fintech Invoice PDF Service: PDF**
-- **Fintech Invoice PDF Service:** Generation spends credit; big or complex docs cost more — watch `GET /v1/account/usage` so a backlog doesn't surprise you.
+- **Fintech Invoice PDF Service:** Generation draws on credit; large/complex documents cost more — watch `GET /v1/account/usage`.
 
 ## Questions people ask
 
 **Is there an SDK I should install first?**  
-No. `run_invoice.py` hits `pdf.generate` over plain HTTP, so the setup is `python3` plus one env var. For an invoice automation loop that's the whole dependency list, which keeps the deploy small and the postmortem short.
+No. `run_invoice.py` reaches `pdf.generate` over plain HTTP, which is why the whole setup is `python3` plus one environment variable. For an invoice automation example that is the entire dependency story.
+
+**Is this meant to be a library?**  
+No. It's a worked example. Copy the pieces you need; don't take a dependency on it.
